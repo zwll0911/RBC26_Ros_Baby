@@ -1,0 +1,16 @@
+# --- ROS 2 Standard Ignored Files ---
+build/
+install/
+log/
+
+# --- Python & Editor Junk ---
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
+*.swp
+
+# --- Specific Workspace Ignores ---
+# Ignore the huge downloaded repos in micro-ROS that get built automatically
+# (Optional: Keep this commented out if you WANT to backup the micro-ros source code. 
+# Usually, we back up the src/ folder but ignore the build artifacts.)

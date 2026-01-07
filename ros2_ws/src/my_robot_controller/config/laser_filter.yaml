@@ -1,0 +1,14 @@
+scan_to_scan_filter_chain:
+  ros__parameters:
+    filter1:
+      name: footprint_filter
+      type: laser_filters/LaserScanBoxFilter
+      params:
+        box_frame: base_link
+        max_x: 0.22  # Adjust length of your robot (front)
+        min_x: -0.23 # Adjust length of your robot (back)
+        max_y: 0.22  # Adjust width (left)
+        min_y: -0.22 # Adjust width (right)
+        max_z: 0.20
+        min_z: -0.20
+        invert: false # False = Delete points INSIDE the box
