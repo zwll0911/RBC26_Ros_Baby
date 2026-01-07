@@ -19,8 +19,8 @@ class MissionController(Node):
 
         # --- CONFIGURATION ---
         # "Search Zone" Coordinates (Change these to your Map Point!)
-        self.search_zone_x = 3.31
-        self.search_zone_y = 1.48
+        self.search_zone_x = 0.0442
+        self.search_zone_y = 5.8290
 
         # --- PUBS/SUBS ---
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -40,7 +40,7 @@ class MissionController(Node):
         self.target_found = False
         self.error_x = 0.0
         self.tof_dist = 9999.0
-        self.turn_kp = 0.005
+        self.turn_kp = 0.01
         self.stop_distance = 170.0
 
         # Loop
@@ -123,7 +123,7 @@ class MissionController(Node):
                 cmd.angular.z = 0.0
                 self.current_state = STATE_APPROACH
             else:
-                cmd.angular.z = 0.3 # Spin to find it
+                cmd.angular.z = 0.05 # Spin to find it
 
         elif self.current_state == STATE_APPROACH:
             if not self.target_found:
@@ -134,7 +134,7 @@ class MissionController(Node):
 
             if abs(self.error_x) < 50:
                 if self.tof_dist > self.stop_distance:
-                    cmd.linear.x = 0.2
+                    cmd.linear.x = 0.1
                 else:
                     cmd.linear.x = 0.0
                     cmd.angular.z = 0.0

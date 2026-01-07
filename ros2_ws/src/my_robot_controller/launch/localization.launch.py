@@ -9,8 +9,11 @@ def generate_launch_description():
     
     package_name = 'my_robot_controller'
     
-    # PATHS
-    map_file_path = os.path.join(os.path.expanduser('~'), 'test_map.yaml')
+    map_file_path = os.path.join(
+        get_package_share_directory(package_name),
+        'config',
+        'map.yaml'
+    )
     
     amcl_config = os.path.join(
         get_package_share_directory(package_name),
