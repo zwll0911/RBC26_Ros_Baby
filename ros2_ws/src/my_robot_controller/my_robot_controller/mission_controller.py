@@ -2,43 +2,52 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from std_msgs.msg import Float32MultiArray, Bool, String, Int32
-from geometry_msgs.msg import Twist, PoseStamped
+from std_msgs.msg import Float32MultiArray, String, Int32
+from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
+import time
 
 # --- STATES ---
-STATE_IDLE = 0        # Waiting for user command
-STATE_NAVIGATING = 1  # Driving to the Search Zone
-STATE_SEARCH = 2      # Spinning to find object
-STATE_APPROACH = 3    # Visual Servoing
-STATE_GRAB = 4        # Simulated Grabbing
+STATE_IDLE = 0        
+STATE_NAV_A = 1       # Go to Cube Zone
+STATE_SEARCH_A = 2    # Find Cube
+STATE_APPROACH_A = 3  # Move to Cube
+STATE_PICK = 4        # Grab Cube
+
+STATE_NAV_B = 5       # Go to Platform Zone
+STATE_SEARCH_B = 6    # Find Platform
+STATE_APPROACH_B = 7  # Move to Platform
+STATE_PLACE = 8       # Drop Cube
 
 class MissionController(Node):
     def __init__(self):
         super().__init__('mission_controller')
 
-        # --- CONFIGURATION ---
-        # "Search Zone" Coordinates (Change these to your Map Point!)
-        self.search_zone_x = -0.0355
-        self.search_zone_y = 5.8193
+        # --- COORDINATES ---
+        self.pos_a_x = -0.0355; self.pos_a_y = 5.8193 # Cube Zone
+        self.pos_b_x = 1.2317;  self.pos_b_y = 5.8446 # Platform Zone
 
-        # --- SPEED SETTINGS (NEW) ---
+        # --- SPEED & DISTANCE SETTINGS ---
         self.max_approach_speed = 0.4   
         self.min_approach_speed = 0.08  
-        self.slowdown_radius = 600.0   
-        self.stop_distance = 175.0   
+        self.max_turn_kp = 0.003
+        self.min_turn_kp = 0.001
+        self.slowdown_radius = 600.0    
+        
+        # Stop distances
+        self.stop_distance_cube = 175.0     
+        self.stop_distance_platform = 110.0 
 
         # --- PUBS/SUBS ---
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.tracker_trigger_pub = self.create_publisher(Bool, '/enable_tracking', 10)
+        self.vision_mode_pub = self.create_publisher(Int32, '/vision_mode', 10)
         self.gripper_pub = self.create_publisher(Int32, '/gripper_cmd', 10)
         
         self.create_subscription(Float32MultiArray, '/target_info', self.vision_callback, 10)
         self.create_subscription(Float32MultiArray, '/robot_status', self.sensor_callback, 10)
         self.create_subscription(String, '/mission_trigger', self.trigger_callback, 10)
 
-        # --- NAV2 ACTION CLIENT ---
         self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         # --- VARIABLES ---
@@ -46,151 +55,178 @@ class MissionController(Node):
         self.target_found = False
         self.error_x = 0.0
         self.tof_dist = 9999.0
-        self.turn_kp = 0.001
-        self.stop_distance = 170.0
 
-        # Loop
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Mission Controller Ready. Waiting for '/mission_trigger'...")
+        self.get_logger().info("Mission Ready. Waiting for 'start'...")
 
     def trigger_callback(self, msg):
         if msg.data == "start" and self.current_state == STATE_IDLE:
-            self.get_logger().info("RECEIVED START COMMAND!")
-            reset_msg = Int32()
-            reset_msg.data = 3
-            self.gripper_pub.publish(reset_msg)
-            self.start_navigation()
+            self.get_logger().info("STARTING MISSION...")
+            
+            # 1. Reset Servos
+            self.send_gripper_cmd(3) # 3 = RESET
+            time.sleep(1.0) 
+            self.send_gripper_cmd(0)
+            time.sleep(1.0)
+
+            # 2. Go to Point A (Cube)
+            # Orientation: z=0.9225, w=0.3860
+            self.send_nav_goal(self.pos_a_x, self.pos_a_y, 0.9225, 0.3860)
+            self.current_state = STATE_NAV_A
+
+    def send_gripper_cmd(self, val):
+        msg = Int32(); msg.data = val
+        self.gripper_pub.publish(msg)
+
+    def set_vision_mode(self, mode):
+        # 0=Idle, 1=Cube, 2=Platform
+        msg = Int32(); msg.data = mode
+        self.vision_mode_pub.publish(msg)
 
     def vision_callback(self, msg):
-        if len(msg.data) >= 3:
+        if len(msg.data) >= 2:
             self.target_found = bool(msg.data[0])
             self.error_x = msg.data[1]
 
     def sensor_callback(self, msg):
-        if len(msg.data) >= 2:
-            self.tof_dist = msg.data[1]
+        if len(msg.data) >= 2: self.tof_dist = msg.data[1]
 
-    # --- NAVIGATION LOGIC ---
-    def start_navigation(self):
-        self.current_state = STATE_NAVIGATING
-        self.get_logger().info(f"Navigating to Search Zone ({self.search_zone_x}, {self.search_zone_y})...")
-        
-        # Check server existence
-        if not self._nav_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("Nav2 Action Server not available! Is Navigation running?")
-            self.current_state = STATE_IDLE
-            return
-
-        self.send_nav_goal()
-
-    def send_nav_goal(self):
-        # 1. Create Goal
+    # --- NAVIGATION HELPER (Updated with Orientation) ---
+    def send_nav_goal(self, x, y, z, w):
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = 'map'
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        # Orientation is now passed as arguments
+        goal_msg.pose.pose.orientation.z = z
+        goal_msg.pose.pose.orientation.w = w
         
-        goal_msg.pose.pose.position.x = self.search_zone_x
-        goal_msg.pose.pose.position.y = self.search_zone_y
-        
-        # ORIENTATION: Facing Backwards (180 degrees)
-        goal_msg.pose.pose.orientation.z = 0.9225
-        goal_msg.pose.pose.orientation.w = 0.3860
-
-        # 2. Send Goal
-        self.get_logger().info("Sending Goal...")
-        self._send_goal_future = self._nav_client.send_goal_async(goal_msg)
-        self._send_goal_future.add_done_callback(self.goal_response_callback)
+        self.get_logger().info(f"Navigating to {x}, {y}...")
+        self._nav_client.wait_for_server()
+        future = self._nav_client.send_goal_async(goal_msg)
+        future.add_done_callback(self.goal_response_callback)
 
     def goal_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error("Goal rejected by Nav2. Retrying in 1 second...")
-            self.send_nav_goal() 
+            self.get_logger().error("Goal Rejected! Retrying...")
             return
-        
-        self.get_logger().info("Goal accepted! Driving...")
-        self._get_result_future = goal_handle.get_result_async()
-        self._get_result_future.add_done_callback(self.get_result_callback)
+        goal_handle.get_result_async().add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        result = future.result()
-        status = result.status
-
+        status = future.result().status
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info("ARRIVED AT SEARCH ZONE (SUCCESS)!")
+            self.get_logger().info("DESTINATION REACHED!")
             
-            msg = Bool()
-            msg.data = True
-            self.tracker_trigger_pub.publish(msg)
+            # --- LOGIC SWITCHER ---
+            if self.current_state == STATE_NAV_A:
+                self.get_logger().info("Searching for CUBE...")
+                self.set_vision_mode(1) # Enable Cube Model
+                self.current_state = STATE_SEARCH_A
             
-            self.current_state = STATE_SEARCH
-        
+            elif self.current_state == STATE_NAV_B:
+                self.get_logger().info("Searching for PLATFORM...")
+                self.set_vision_mode(2) # Enable Platform Model
+                self.current_state = STATE_SEARCH_B
+
         else:
             self.get_logger().warn(f"Navigation Failed with status: {status}. RETRYING NOW...")
             self.send_nav_goal()
 
-    # --- CONTROL LOOP ---
+    # --- HELPER: CALCULATE SPEED ---
+    def get_approach_speed(self, distance, stop_dist):
+        if distance > self.slowdown_radius:
+            return self.max_approach_speed
+        else:
+            ratio = (distance - stop_dist) / (self.slowdown_radius - stop_dist)
+            # Clamp ratio between 0 and 1 to be safe
+            ratio = max(0.0, min(1.0, ratio)) 
+            return self.min_approach_speed + (self.max_approach_speed - self.min_approach_speed) * ratio
+        
+    def get_turn_kp(self, distance, stop_dist):
+        if distance > self.slowdown_radius:
+            return self.max_turn_kp # Fast turns when far
+        else:
+            # Scale down the KP as we get closer
+            ratio = (distance - stop_dist) / (self.slowdown_radius - stop_dist)
+            ratio = max(0.0, min(1.0, ratio))
+            return self.min_turn_kp + (self.max_turn_kp - self.min_turn_kp) * ratio
+
+    # --- MAIN LOOP ---
     def control_loop(self):
         cmd = Twist()
 
-        if self.current_state == STATE_IDLE:
-            pass 
-
-        elif self.current_state == STATE_NAVIGATING:
-            pass
-
-        elif self.current_state == STATE_SEARCH:
+        # === PHASE 1: PICK CUBE ===
+        if self.current_state == STATE_SEARCH_A:
             if self.target_found:
-                self.get_logger().info("TARGET SPOTTED! Approaching...")
-                cmd.angular.z = 0.0
-                self.current_state = STATE_APPROACH
+                self.current_state = STATE_APPROACH_A
             else:
-                cmd.angular.z = 0.2
+                cmd.angular.z = 0.2 # Spin to find cube
 
-        elif self.current_state == STATE_APPROACH:
+        elif self.current_state == STATE_APPROACH_A:
             if not self.target_found:
-                self.current_state = STATE_SEARCH
+                self.current_state = STATE_SEARCH_A
                 return
+            
+            current_turn_kp = self.get_turn_kp(self.tof_dist, self.stop_distance_cube)
+            cmd.angular.z = self.error_x * current_turn_kp
 
-            cmd.angular.z = self.error_x * self.turn_kp
-
-            if abs(self.error_x) < 10:
-                if self.tof_dist > self.stop_distance:
-                    if self.tof_dist > self.slowdown_radius:
-                        cmd.linear.x = self.max_approach_speed
-                    else:
-                        ratio = (self.tof_dist - self.stop_distance) / (self.slowdown_radius - self.stop_distance)
-                        speed = self.min_approach_speed + (self.max_approach_speed - self.min_approach_speed) * ratio
-                        cmd.linear.x = speed
+            if abs(self.error_x) < 20: 
+                if self.tof_dist > self.stop_distance_cube:
+                    cmd.linear.x = self.get_approach_speed(self.tof_dist, self.stop_distance_cube)
                 else:
-                    cmd.linear.x = 0.0
-                    cmd.angular.z = 0.0
-                    self.current_state = STATE_GRAB
+                    self.cmd_pub.publish(Twist()) # Stop
+                    self.current_state = STATE_PICK
+
+        elif self.current_state == STATE_PICK:
+            self.get_logger().info("ACTION: PICKING CUBE")
+            self.set_vision_mode(0) # Stop Vision
+            self.send_gripper_cmd(1) # 1 = PICK
+            time.sleep(0.1)
+            self.send_gripper_cmd(0)
+            
+            time.sleep(3.0) 
+            
+            self.get_logger().info("Moving to Point B...")
+            # Point B Orientation: z=0.3852, w=0.9228
+            self.send_nav_goal(self.pos_b_x, self.pos_b_y, 0.3852, 0.9228)
+            self.current_state = STATE_NAV_B
+
+        # === PHASE 2: PLACE ON PLATFORM ===
+        elif self.current_state == STATE_SEARCH_B:
+            if self.target_found:
+                self.current_state = STATE_APPROACH_B
             else:
-                cmd.linear.x = 0.0
+                cmd.angular.z = -0.2 # Spin to find platform
 
-        elif self.current_state == STATE_GRAB:
-            self.get_logger().info("GRABBING... Sending Signal to ESP32!")
+        elif self.current_state == STATE_APPROACH_B:
+            if not self.target_found:
+                self.current_state = STATE_SEARCH_B
+                return
             
-            # 1. Stop the Robot
-            cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
-            self.cmd_pub.publish(cmd) # Ensure it stops immediately
+            current_turn_kp = self.get_turn_kp(self.tof_dist, self.stop_distance_platform)
+            cmd.angular.z = self.error_x * current_turn_kp
 
-            # 2. Disable Tracker
-            msg_track = Bool()
-            msg_track.data = False
-            self.tracker_trigger_pub.publish(msg_track)
-            
-            # 3. SEND GRAB COMMAND (New)
-            msg_grip = Int32()
-            msg_grip.data = 1
-            self.gripper_pub.publish(msg_grip)
+            if abs(self.error_x) < 20:
+                if self.tof_dist > self.stop_distance_platform:
+                    cmd.linear.x = self.get_approach_speed(self.tof_dist, self.stop_distance_platform)
+                else:
+                    self.cmd_pub.publish(Twist()) # Stop
+                    self.current_state = STATE_PLACE
 
-            # 4. Wait/Reset (Optional logic)
-            self.current_state = STATE_IDLE
+        elif self.current_state == STATE_PLACE:
+            self.get_logger().info("ACTION: PLACING CUBE")
+            self.set_vision_mode(0) # Stop Vision
+            self.send_gripper_cmd(2) # 2 = PLACE
+            time.sleep(0.1)
+            self.send_gripper_cmd(0)
 
-        if self.current_state in [STATE_SEARCH, STATE_APPROACH, STATE_GRAB]:
+            time.sleep(3.0)
+            self.current_state = STATE_IDLE # Mission Complete!
+
+        # Publish Velocity
+        if self.current_state in [STATE_SEARCH_A, STATE_APPROACH_A, STATE_SEARCH_B, STATE_APPROACH_B]:
             self.cmd_pub.publish(cmd)
 
 def main(args=None):

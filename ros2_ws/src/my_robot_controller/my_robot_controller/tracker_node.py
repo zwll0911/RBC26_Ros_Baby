@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, Bool
+from std_msgs.msg import Float32MultiArray, Int32
 from sensor_msgs.msg import Image 
-from cv_bridge import CvBridge     
+from cv_bridge import CvBridge      
 import cv2
 import numpy as np
 import onnxruntime as ort
@@ -24,46 +24,57 @@ class ObjectTracker(Node):
         super().__init__('object_tracker')
 
         package_share = get_package_share_directory('my_robot_controller')
-        self.model_path = os.path.join(package_share, 'config', 'mrc_yellow_cude_320.onnx')
+        
+        # --- PATHS TO MODELS ---
+        self.path_cube = os.path.join(package_share, 'config', 'mrc_yellow_cude_320.onnx')
+        self.path_platform = os.path.join(package_share, 'config', 'platform.onnx')
     
         self.target_pub = self.create_publisher(Float32MultiArray, '/target_info', 10)
         self.debug_pub = self.create_publisher(Image, '/camera/debug', 10)
 
-        self.tracking_enabled = False # Start Sleeping
-        self.create_subscription(Bool, '/enable_tracking', self.enable_callback, 10)
+        # --- MODE CONTROL ---
+        self.vision_mode = 0 # 0=Idle, 1=Cube, 2=Platform
+        self.create_subscription(Int32, '/vision_mode', self.mode_callback, 10)
         
         self.bridge = CvBridge()
         self.lock = threading.Lock()
         self.latest_frame = None        
-        self.current_box = None        
+        self.current_box = None         
         self.smooth_box = None      
-        self.running = True            
+        self.running = True             
 
-        self.get_logger().info(f"Loading Model: {self.model_path}")
-        try:
-            sess_options = ort.SessionOptions()
-            sess_options.intra_op_num_threads = 4 
-            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            self.session = ort.InferenceSession(self.model_path, sess_options, providers=['CPUExecutionProvider'])
-            self.input_name = self.session.get_inputs()[0].name
-            self.output_names = [o.name for o in self.session.get_outputs()]
-            self.get_logger().info("Model Loaded!")
-        except Exception as e:
-            self.get_logger().error(f"Failed to load model: {e}")
-            exit()
+        # --- LOAD MODELS ---
+        self.session_cube = self.load_onnx_model(self.path_cube, "Cube")
+        self.session_platform = self.load_onnx_model(self.path_platform, "Platform")
 
         self.cam_thread = threading.Thread(target=self.camera_loop)
         self.cam_thread.start()
         
         self.timer = self.create_timer(0.01, self.ai_callback)
 
-    def enable_callback(self, msg):
-        self.tracking_enabled = msg.data
-        if self.tracking_enabled:
-            self.get_logger().info("TRACKER ENABLED: Hunting for Cube!")
-        else:
-            self.get_logger().info("TRACKER DISABLED: Sleeping...")
+    def load_onnx_model(self, path, name):
+        """ Helper function to load ONNX models safely """
+        self.get_logger().info(f"Loading {name} Model: {path}")
+        try:
+            sess_options = ort.SessionOptions()
+            sess_options.intra_op_num_threads = 4 
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            session = ort.InferenceSession(path, sess_options, providers=['CPUExecutionProvider'])
+            self.get_logger().info(f"{name} Model Loaded Successfully!")
+            return session
+        except Exception as e:
+            self.get_logger().error(f"FAILED to load {name} model: {e}")
+            return None
+
+    def mode_callback(self, msg):
+        self.vision_mode = msg.data
+        mode_map = {0: "IDLE", 1: "CUBE", 2: "PLATFORM"}
+        
+        mode_name = mode_map.get(self.vision_mode, "UNKNOWN")
+        self.get_logger().info(f"VISION MODE SWITCHED: {mode_name}")
+        
+        if self.vision_mode == 0:
             self.current_box = None
 
     def camera_loop(self):
@@ -78,13 +89,21 @@ class ObjectTracker(Node):
             ret, frame = cap.read()
             if not ret: continue
 
-            if not self.tracking_enabled:
+            # If Idle, slow down camera loop to save CPU
+            if self.vision_mode == 0:
                 time.sleep(0.1)
+                
+                # Still publish debug image saying "SLEEPING"
+                cv2.putText(frame, "AI IDLE (Mode 0)", (20, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                ros_image = self.bridge.cv2_to_imgmsg(frame, "bgr8")
+                self.debug_pub.publish(ros_image)
                 continue
 
             with self.lock:
                 self.latest_frame = frame.copy()
 
+            # --- DRAWING LOGIC (Visual Feedback) ---
             if self.current_box is not None:
                 tx, ty, tw, th = self.current_box
                 
@@ -99,24 +118,32 @@ class ObjectTracker(Node):
                     self.smooth_box = [nsx, nsy, nsw, nsh]
 
                 dx, dy, dw, dh = map(int, self.smooth_box)
-                cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), (0, 255, 0), 3)
-                cv2.putText(frame, "TARGET LOCKED", (dx, dy - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            # Show "SLEEPING" on the video feed if disabled
-            if not self.tracking_enabled:
-                 cv2.putText(frame, "AI SLEEPING", (20, 50), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Color based on mode
+                color = (0, 255, 255) if self.vision_mode == 1 else (255, 0, 0) # Yellow for Cube, Blue for Platform
+                label = "CUBE" if self.vision_mode == 1 else "PLATFORM"
 
+                cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), color, 3)
+                cv2.putText(frame, f"{label} LOCKED", (dx, dy - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Publish Debug Image
             ros_image = self.bridge.cv2_to_imgmsg(frame, "bgr8")
             self.debug_pub.publish(ros_image)
         
         cap.release()
 
     def ai_callback(self):
-        if not self.tracking_enabled:
-            return
+        if self.vision_mode == 0: return
         
+        active_session = None
+        if self.vision_mode == 1:
+            active_session = self.session_cube
+        elif self.vision_mode == 2:
+            active_session = self.session_platform
+
+        if active_session is None: return
+
         with self.lock:
             if self.latest_frame is None: return
             frame = self.latest_frame.copy()
@@ -132,11 +159,14 @@ class ObjectTracker(Node):
         img = img.astype(np.float32) / 255.0
 
         try:
-            outputs = self.session.run(self.output_names, {self.input_name: img})
+            # Run Inference on the ACTIVE session
+            input_name = active_session.get_inputs()[0].name
+            output_names = [o.name for o in active_session.get_outputs()]
+            outputs = active_session.run(output_names, {input_name: img})
         except Exception: return
 
+        # --- POST PROCESSING (YOLO Output Parsing) ---
         predictions = outputs[0]
-        # Handle Output Shape variations
         if predictions.ndim == 3 and predictions.shape[1] < predictions.shape[2]:
              predictions = predictions[0].transpose()
         elif predictions.ndim == 2:
@@ -177,7 +207,6 @@ class ObjectTracker(Node):
         indices = cv2.dnn.NMSBoxes(boxes, confidences, SCORE_THRESHOLD, NMS_THRESHOLD)
         
         msg = Float32MultiArray()
-        # Default: [0=Not Found, 0, 0]
         target_data = [0.0, 0.0, 0.0] 
 
         if len(indices) > 0:
@@ -214,20 +243,14 @@ class ObjectTracker(Node):
                 x, y, w, h = new_box
                 cx = x + (w // 2)
                 
-                # --- CALCULATE ERROR ---
-                # Negative = Object is to the Left (Robot turn Left)
-                # Positive = Object is to the Right (Robot turn Right)
+                # Error Calculation
                 error_x = center_screen_x - cx 
-                
-                # --- PACK DATA ---
-                # [1.0 = FOUND, error_x, width]
                 target_data = [1.0, float(error_x), float(w)]
             else:
                 self.current_box = None
         else:
             self.current_box = None
 
-        # Publish the data for Mission Controller to use
         msg.data = target_data
         self.target_pub.publish(msg)
 
