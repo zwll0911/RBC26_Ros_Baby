@@ -2,9 +2,10 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from std_msgs.msg import Float32MultiArray, Bool, String
+from std_msgs.msg import Float32MultiArray, Bool, String, Int32
 from geometry_msgs.msg import Twist, PoseStamped
 from nav2_msgs.action import NavigateToPose
+from action_msgs.msg import GoalStatus
 
 # --- STATES ---
 STATE_IDLE = 0        # Waiting for user command
@@ -19,17 +20,16 @@ class MissionController(Node):
 
         # --- CONFIGURATION ---
         # "Search Zone" Coordinates (Change these to your Map Point!)
-        self.search_zone_x = 0.0442
-        self.search_zone_y = 5.8290
+        self.search_zone_x = -0.0355
+        self.search_zone_y = 5.8193
 
         # --- PUBS/SUBS ---
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.tracker_trigger_pub = self.create_publisher(Bool, '/enable_tracking', 10)
+        self.gripper_pub = self.create_publisher(Int32, '/gripper_cmd', 10)
         
         self.create_subscription(Float32MultiArray, '/target_info', self.vision_callback, 10)
         self.create_subscription(Float32MultiArray, '/robot_status', self.sensor_callback, 10)
-        
-        # New: Trigger Topic (Send "start" here to begin)
         self.create_subscription(String, '/mission_trigger', self.trigger_callback, 10)
 
         # --- NAV2 ACTION CLIENT ---
@@ -40,7 +40,7 @@ class MissionController(Node):
         self.target_found = False
         self.error_x = 0.0
         self.tof_dist = 9999.0
-        self.turn_kp = 0.01
+        self.turn_kp = 0.001
         self.stop_distance = 170.0
 
         # Loop
@@ -50,6 +50,9 @@ class MissionController(Node):
     def trigger_callback(self, msg):
         if msg.data == "start" and self.current_state == STATE_IDLE:
             self.get_logger().info("RECEIVED START COMMAND!")
+            reset_msg = Int32()
+            reset_msg.data = 3
+            self.gripper_pub.publish(reset_msg)
             self.start_navigation()
 
     def vision_callback(self, msg):
@@ -65,47 +68,60 @@ class MissionController(Node):
     def start_navigation(self):
         self.current_state = STATE_NAVIGATING
         self.get_logger().info(f"Navigating to Search Zone ({self.search_zone_x}, {self.search_zone_y})...")
-
-        # 1. Wait for Nav2
+        
+        # Check server existence
         if not self._nav_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error("Nav2 Action Server not available! Is Navigation running?")
             self.current_state = STATE_IDLE
             return
 
-        # 2. Create Goal
+        self.send_nav_goal()
+
+    def send_nav_goal(self):
+        # 1. Create Goal
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = 'map'
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        
         goal_msg.pose.pose.position.x = self.search_zone_x
         goal_msg.pose.pose.position.y = self.search_zone_y
-        goal_msg.pose.pose.orientation.w = 1.0 # Face East
+        
+        # ORIENTATION: Facing Backwards (180 degrees)
+        goal_msg.pose.pose.orientation.z = 0.9225
+        goal_msg.pose.pose.orientation.w = 0.3860
 
-        # 3. Send Goal
+        # 2. Send Goal
+        self.get_logger().info("Sending Goal...")
         self._send_goal_future = self._nav_client.send_goal_async(goal_msg)
         self._send_goal_future.add_done_callback(self.goal_response_callback)
 
     def goal_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error("Goal rejected :(")
-            self.current_state = STATE_IDLE
+            self.get_logger().error("Goal rejected by Nav2. Retrying in 1 second...")
+            self.send_nav_goal() 
             return
-
+        
         self.get_logger().info("Goal accepted! Driving...")
         self._get_result_future = goal_handle.get_result_async()
         self._get_result_future.add_done_callback(self.get_result_callback)
 
     def get_result_callback(self, future):
-        # This triggers when the robot Arrives at the zone
-        self.get_logger().info("ARRIVED AT SEARCH ZONE!")
+        result = future.result()
+        status = result.status
+
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info("ARRIVED AT SEARCH ZONE (SUCCESS)!")
+            
+            msg = Bool()
+            msg.data = True
+            self.tracker_trigger_pub.publish(msg)
+            
+            self.current_state = STATE_SEARCH
         
-        # 1. Enable the AI Tracker
-        msg = Bool()
-        msg.data = True
-        self.tracker_trigger_pub.publish(msg)
-        
-        # 2. Switch State
-        self.current_state = STATE_SEARCH
+        else:
+            self.get_logger().warn(f"Navigation Failed with status: {status}. RETRYING NOW...")
+            self.send_nav_goal()
 
     # --- CONTROL LOOP ---
     def control_loop(self):
@@ -123,7 +139,7 @@ class MissionController(Node):
                 cmd.angular.z = 0.0
                 self.current_state = STATE_APPROACH
             else:
-                cmd.angular.z = 0.05 # Spin to find it
+                cmd.angular.z = 0.2 # Spin to find it
 
         elif self.current_state == STATE_APPROACH:
             if not self.target_found:
@@ -132,9 +148,9 @@ class MissionController(Node):
 
             cmd.angular.z = self.error_x * self.turn_kp
 
-            if abs(self.error_x) < 50:
+            if abs(self.error_x) < 10:
                 if self.tof_dist > self.stop_distance:
-                    cmd.linear.x = 0.1
+                    cmd.linear.x = 0.3
                 else:
                     cmd.linear.x = 0.0
                     cmd.angular.z = 0.0
@@ -143,14 +159,25 @@ class MissionController(Node):
                 cmd.linear.x = 0.0
 
         elif self.current_state == STATE_GRAB:
-            self.get_logger().info("GRABBING... (Mission Complete for now)")
-            # Stop AI to save CPU
-            msg = Bool()
-            msg.data = False
-            self.tracker_trigger_pub.publish(msg)
+            self.get_logger().info("GRABBING... Sending Signal to ESP32!")
             
-            # Logic to reset or continue...
-            self.current_state = STATE_IDLE 
+            # 1. Stop the Robot
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            self.cmd_pub.publish(cmd) # Ensure it stops immediately
+
+            # 2. Disable Tracker
+            msg_track = Bool()
+            msg_track.data = False
+            self.tracker_trigger_pub.publish(msg_track)
+            
+            # 3. SEND GRAB COMMAND (New)
+            msg_grip = Int32()
+            msg_grip.data = 1
+            self.gripper_pub.publish(msg_grip)
+
+            # 4. Wait/Reset (Optional logic)
+            self.current_state = STATE_IDLE
 
         if self.current_state in [STATE_SEARCH, STATE_APPROACH, STATE_GRAB]:
             self.cmd_pub.publish(cmd)
