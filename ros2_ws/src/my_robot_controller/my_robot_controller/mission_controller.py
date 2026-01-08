@@ -23,6 +23,12 @@ class MissionController(Node):
         self.search_zone_x = -0.0355
         self.search_zone_y = 5.8193
 
+        # --- SPEED SETTINGS (NEW) ---
+        self.max_approach_speed = 0.4   
+        self.min_approach_speed = 0.08  
+        self.slowdown_radius = 600.0   
+        self.stop_distance = 175.0   
+
         # --- PUBS/SUBS ---
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.tracker_trigger_pub = self.create_publisher(Bool, '/enable_tracking', 10)
@@ -128,10 +134,10 @@ class MissionController(Node):
         cmd = Twist()
 
         if self.current_state == STATE_IDLE:
-            pass # Do nothing, wait for trigger
+            pass 
 
         elif self.current_state == STATE_NAVIGATING:
-            pass # Do nothing, Nav2 is driving the wheels
+            pass
 
         elif self.current_state == STATE_SEARCH:
             if self.target_found:
@@ -139,7 +145,7 @@ class MissionController(Node):
                 cmd.angular.z = 0.0
                 self.current_state = STATE_APPROACH
             else:
-                cmd.angular.z = 0.2 # Spin to find it
+                cmd.angular.z = 0.2
 
         elif self.current_state == STATE_APPROACH:
             if not self.target_found:
@@ -150,7 +156,12 @@ class MissionController(Node):
 
             if abs(self.error_x) < 10:
                 if self.tof_dist > self.stop_distance:
-                    cmd.linear.x = 0.3
+                    if self.tof_dist > self.slowdown_radius:
+                        cmd.linear.x = self.max_approach_speed
+                    else:
+                        ratio = (self.tof_dist - self.stop_distance) / (self.slowdown_radius - self.stop_distance)
+                        speed = self.min_approach_speed + (self.max_approach_speed - self.min_approach_speed) * ratio
+                        cmd.linear.x = speed
                 else:
                     cmd.linear.x = 0.0
                     cmd.angular.z = 0.0

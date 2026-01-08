@@ -9,7 +9,7 @@ from ament_index_python.packages import get_package_share_directory
 def generate_launch_description():
     
     # --- HARDWARE CONFIG ---
-    lidar_serial_port = '/dev/ttyUSB1' 
+    lidar_serial_port = '/dev/ttyUSB0' 
     
     # 1. RPLIDAR Driver (Input: Real World -> Output: /scan)
     lidar_launch = IncludeLaunchDescription(
