@@ -24,19 +24,23 @@ class MissionController(Node):
     def __init__(self):
         super().__init__('mission_controller')
 
-        # --- COORDINATES ---
+        # --- CONFIGURATION ---
         self.pos_a_x = -0.0355; self.pos_a_y = 5.8193 # Cube Zone
-        self.pos_b_x = 1.2317;  self.pos_b_y = 5.8446 # Platform Zone
+        self.pos_b_x = 1.3364;  self.pos_b_y = 5.5942 # Platform Zone
+        
+        # --- LOOP CONFIGURATION ---
+        self.max_mission_loops = 3 
+        self.current_loop_count = 0
 
         # --- SPEED & DISTANCE SETTINGS ---
         self.max_approach_speed = 0.4   
         self.min_approach_speed = 0.08  
-        self.max_turn_kp = 0.003
+        self.max_turn_kp = 0.002
         self.min_turn_kp = 0.001
         self.slowdown_radius = 600.0    
         
         # Stop distances
-        self.stop_distance_cube = 175.0     
+        self.stop_distance_cube = 180.0     
         self.stop_distance_platform = 110.0 
 
         # --- PUBS/SUBS ---
@@ -57,22 +61,25 @@ class MissionController(Node):
         self.tof_dist = 9999.0
 
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Mission Ready. Waiting for 'start'...")
+        self.get_logger().info(f"Mission Ready. Will run {self.max_mission_loops} times.")
 
     def trigger_callback(self, msg):
         if msg.data == "start" and self.current_state == STATE_IDLE:
             self.get_logger().info("STARTING MISSION...")
-            
-            # 1. Reset Servos
-            self.send_gripper_cmd(3) # 3 = RESET
-            time.sleep(1.0) 
-            self.send_gripper_cmd(0)
-            time.sleep(1.0)
+            self.current_loop_count = 0 # Reset counter on manual start
+            self.start_sequence()
 
-            # 2. Go to Point A (Cube)
-            # Orientation: z=0.9225, w=0.3860
-            self.send_nav_goal(self.pos_a_x, self.pos_a_y, 0.9225, 0.3860)
-            self.current_state = STATE_NAV_A
+    def start_sequence(self):
+        # 1. Reset Servos
+        self.send_gripper_cmd(3) # 3 = RESET
+        time.sleep(1.0) 
+        self.send_gripper_cmd(0)
+        time.sleep(1.0)
+
+        # 2. Go to Point A (Cube)
+        # Orientation: z=0.9225, w=0.3860
+        self.send_nav_goal(self.pos_a_x, self.pos_a_y, 0.9225, 0.3860)
+        self.current_state = STATE_NAV_A
 
     def send_gripper_cmd(self, val):
         msg = Int32(); msg.data = val
@@ -91,14 +98,13 @@ class MissionController(Node):
     def sensor_callback(self, msg):
         if len(msg.data) >= 2: self.tof_dist = msg.data[1]
 
-    # --- NAVIGATION HELPER (Updated with Orientation) ---
+    # --- NAVIGATION HELPER ---
     def send_nav_goal(self, x, y, z, w):
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = 'map'
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
-        # Orientation is now passed as arguments
         goal_msg.pose.pose.orientation.z = z
         goal_msg.pose.pose.orientation.w = w
         
@@ -131,8 +137,12 @@ class MissionController(Node):
                 self.current_state = STATE_SEARCH_B
 
         else:
-            self.get_logger().warn(f"Navigation Failed with status: {status}. RETRYING NOW...")
-            self.send_nav_goal()
+            self.get_logger().warn(f"Navigation Failed (Status: {status})... Retrying...")
+            if self.current_state == STATE_NAV_A:
+                self.send_nav_goal(self.pos_a_x, self.pos_a_y, 0.9225, 0.3860)
+                
+            elif self.current_state == STATE_NAV_B:
+                self.send_nav_goal(self.pos_b_x, self.pos_b_y, 0.6208, 0.7840)
 
     # --- HELPER: CALCULATE SPEED ---
     def get_approach_speed(self, distance, stop_dist):
@@ -140,15 +150,13 @@ class MissionController(Node):
             return self.max_approach_speed
         else:
             ratio = (distance - stop_dist) / (self.slowdown_radius - stop_dist)
-            # Clamp ratio between 0 and 1 to be safe
             ratio = max(0.0, min(1.0, ratio)) 
             return self.min_approach_speed + (self.max_approach_speed - self.min_approach_speed) * ratio
         
     def get_turn_kp(self, distance, stop_dist):
         if distance > self.slowdown_radius:
-            return self.max_turn_kp # Fast turns when far
+            return self.max_turn_kp 
         else:
-            # Scale down the KP as we get closer
             ratio = (distance - stop_dist) / (self.slowdown_radius - stop_dist)
             ratio = max(0.0, min(1.0, ratio))
             return self.min_turn_kp + (self.max_turn_kp - self.min_turn_kp) * ratio
@@ -189,8 +197,7 @@ class MissionController(Node):
             time.sleep(3.0) 
             
             self.get_logger().info("Moving to Point B...")
-            # Point B Orientation: z=0.3852, w=0.9228
-            self.send_nav_goal(self.pos_b_x, self.pos_b_y, 0.3852, 0.9228)
+            self.send_nav_goal(self.pos_b_x, self.pos_b_y, 0.6208, 0.7840)
             self.current_state = STATE_NAV_B
 
         # === PHASE 2: PLACE ON PLATFORM ===
@@ -223,7 +230,17 @@ class MissionController(Node):
             self.send_gripper_cmd(0)
 
             time.sleep(3.0)
-            self.current_state = STATE_IDLE # Mission Complete!
+            
+            # --- [NEW] LOOP CHECK LOGIC ---
+            self.current_loop_count += 1
+            self.get_logger().info(f"Mission Loop {self.current_loop_count}/{self.max_mission_loops} Complete.")
+
+            if self.current_loop_count < self.max_mission_loops:
+                self.get_logger().info("Restarting Sequence...")
+                self.start_sequence() # Go back to Point A
+            else:
+                self.get_logger().info("ALL MISSIONS COMPLETE. STOPPING.")
+                self.current_state = STATE_IDLE
 
         # Publish Velocity
         if self.current_state in [STATE_SEARCH_A, STATE_APPROACH_A, STATE_SEARCH_B, STATE_APPROACH_B]:
