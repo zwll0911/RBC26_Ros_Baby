@@ -27,7 +27,7 @@ class ObjectTracker(Node):
         
         # --- PATHS TO MODELS ---
         self.path_cube = os.path.join(package_share, 'config', 'mrc_yellow_cude_320.onnx')
-        self.path_platform = os.path.join(package_share, 'config', 'platform_3.onnx')
+        self.path_platform = os.path.join(package_share, 'config', 'platform_4.onnx')
     
         self.target_pub = self.create_publisher(Float32MultiArray, '/target_info', 10)
         self.debug_pub = self.create_publisher(Image, '/camera/debug', 10)

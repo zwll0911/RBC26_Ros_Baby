@@ -50,7 +50,10 @@ def generate_launch_description():
     odom_node = Node(
         package='my_robot_controller',
         executable='odometry',
-        name='odometry_node'
+        name='odometry_node',
+        output='screen',
+        respawn=True,
+        respawn_delay=2.0
     )
 
     # --- MISSION & APPS ---

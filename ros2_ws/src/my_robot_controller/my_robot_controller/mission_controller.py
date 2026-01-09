@@ -40,8 +40,10 @@ class MissionController(Node):
         self.slowdown_radius = 600.0    
         
         # Stop distances
-        self.stop_distance_cube = 180.0     
+        self.stop_distance_cube = 190.0     
         self.stop_distance_platform = 110.0 
+        self.stable_stop_count = 0
+        self.required_stop_counts = 3
 
         # --- PUBS/SUBS ---
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -167,6 +169,7 @@ class MissionController(Node):
 
         # === PHASE 1: PICK CUBE ===
         if self.current_state == STATE_SEARCH_A:
+            self.stable_stop_count = 0
             if self.target_found:
                 self.current_state = STATE_APPROACH_A
             else:
@@ -181,11 +184,17 @@ class MissionController(Node):
             cmd.angular.z = self.error_x * current_turn_kp
 
             if abs(self.error_x) < 20: 
-                if self.tof_dist > self.stop_distance_cube:
-                    cmd.linear.x = self.get_approach_speed(self.tof_dist, self.stop_distance_cube)
+                if self.tof_dist <= self.stop_distance_cube:
+                    self.stable_stop_count += 1
                 else:
-                    self.cmd_pub.publish(Twist()) # Stop
+                    self.stable_stop_count = 0
+                    cmd.linear.x = self.get_approach_speed(self.tof_dist, self.stop_distance_cube)
+
+                if self.stable_stop_count >= self.required_stop_counts:
+                    self.get_logger().info("STABLE TARGET REACHED (Pick)")
+                    self.cmd_pub.publish(Twist()) # Force Stop
                     self.current_state = STATE_PICK
+                    self.stable_stop_count = 0 # Reset for next time
 
         elif self.current_state == STATE_PICK:
             self.get_logger().info("ACTION: PICKING CUBE")
@@ -216,11 +225,17 @@ class MissionController(Node):
             cmd.angular.z = self.error_x * current_turn_kp
 
             if abs(self.error_x) < 20:
-                if self.tof_dist > self.stop_distance_platform:
-                    cmd.linear.x = self.get_approach_speed(self.tof_dist, self.stop_distance_platform)
+                if self.tof_dist <= self.stop_distance_platform:
+                    self.stable_stop_count += 1
                 else:
-                    self.cmd_pub.publish(Twist()) # Stop
+                    self.stable_stop_count = 0 # Reset
+                    cmd.linear.x = self.get_approach_speed(self.tof_dist, self.stop_distance_platform)
+
+                if self.stable_stop_count >= self.required_stop_counts:
+                    self.get_logger().info("STABLE TARGET REACHED (Place)")
+                    self.cmd_pub.publish(Twist()) # Force Stop
                     self.current_state = STATE_PLACE
+                    self.stable_stop_count = 0
 
         elif self.current_state == STATE_PLACE:
             self.get_logger().info("ACTION: PLACING CUBE")
